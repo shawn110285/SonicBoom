@@ -1,114 +1,454 @@
-/* ============================================================================
-  A Verilog main() program that calls a local serial port co-simulator.
-  =============================================================================*/
-using namespace std;
+// See LICENSE.SiFive for license details.
+// See LICENSE.Berkeley for license details.
 
-#include <verilated.h>
+// using namespace std;
+
+#if VM_TRACE
+#include <memory>
+#if CY_FST_TRACE
+#include "verilated_fst_c.h"
+#else
+#include "verilated.h"
 #include "verilated_vcd_c.h"
+#endif // CY_FST_TRACE
+#endif // VM_TRACE
+
 #include "VTestHarness.h"       //auto created by the verilator from the rtl
 #include "VTestHarness__Dpi.h"   //auto created by the verilator from the rtl that support dpi
 #include "remote_bitbang.h"
 
+#include <iostream>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <getopt.h>
 
-int main(int argc,  char ** argv)
+// For option parsing, which is split across this file, Verilog, and
+// FESVR's HTIF, a few external files must be pulled in. The list of
+// files and what they provide is enumerated:
+//
+// $RISCV/include/fesvr/htif.h:
+//   defines:
+//     - HTIF_USAGE_OPTIONS
+//     - HTIF_LONG_OPTIONS_OPTIND
+//     - HTIF_LONG_OPTIONS
+// $(ROCKETCHIP_DIR)/generated-src(-debug)?/$(CONFIG).plusArgs:
+//   defines:
+//     - PLUSARG_USAGE_OPTIONS
+//   variables:
+//     - static const char * verilog_plusargs
+
+#define HTIF_LONG_OPTIONS_OPTIND 1024
+#define HTIF_LONG_OPTIONS                                               \
+{"help",      no_argument,       0, 'h'                          },     \
+{"rfb",       optional_argument, 0, HTIF_LONG_OPTIONS_OPTIND     },     \
+{"disk",      required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 1 },     \
+{"signature", required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 2 },     \
+{"chroot",    required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 3 },     \
+{"payload",   required_argument, 0, HTIF_LONG_OPTIONS_OPTIND + 4 },     \
+{0, 0, 0, 0}
+
+
+#define HTIF_USAGE_OPTIONS \
+"HOST OPTIONS\n\
+  -h, --help               Display this help and exit\n\
+  +h,  +help\n\
+       +permissive         The host will ignore any unparsed options up until\n\
+                             +permissive-off (Only needed for VCS)\n\
+       +permissive-off     Stop ignoring options. This is mandatory if using\n\
+                             +permissive (Only needed for VCS)\n\
+      --rfb=DISPLAY        Add new remote frame buffer on display DISPLAY\n\
+       +rfb=DISPLAY          to be accessible on 5900 + DISPLAY (default = 0)\n\
+      --signature=FILE     Write torture test signature to FILE\n\
+       +signature=FILE\n\
+      --chroot=PATH        Use PATH as location of syscall-servicing binaries\n\
+       +chroot=PATH\n\
+      --payload=PATH       Load PATH memory as an additional ELF payload\n\
+       +payload=PATH\n\
+\n\
+HOST OPTIONS (currently unsupported)\n\
+      --disk=DISK          Add DISK device. Use a ramdisk since this isn't\n\
+       +disk=DISK            supported\n\
+\n\
+TARGET (RISC-V BINARY) OPTIONS\n\
+  These are the options passed to the program executing on the emulated RISC-V\n\
+  microprocessor.\n"
+
+#define PLUSARG_USAGE_OPTIONS "EMULATOR VERILOG PLUSARGS\n\
+       +tilelink_timeout=INT\n\
+                           Kill emulation after INT waiting TileLink cycles. Off if 0.\n\
+                             (default=0)\n\
+\n\
+       +uart_tx=INT\n\
+                           Enable/disable the TX to speed up simulation\n\
+                             (default=1)\n\
+\n\
+       +jtag_rbb_enable=INT\n\
+                           Enable SimJTAG for JTAG Connections. Simulation will pause until connection is made.\n\
+                             (default=0)\n\
+"
+static const char * verilog_plusargs [] = {\
+                                            "tilelink_timeout",\
+                                            "uart_tx",\
+                                            "jtag_rbb_enable",\
+                                            0};
+
+
+extern remote_bitbang_t * jtag;
+
+static uint64_t trace_count = 0;
+bool verbose = false;
+bool done_reset = false;
+
+
+double sc_time_stamp()
 {
-    printf("Built with %s %s.\n", Verilated::productName(),
-    Verilated::productVersion());
-    printf("Recommended: Verilator 4.0 or later.\n");
-
-
-    // call commandArgs first!
-    VerilatedContext* contextp = new VerilatedContext;
-    contextp->commandArgs(argc, argv);
-
-    // Set debug level, 0 is off, 9 is highest presently used
-    Verilated::debug(0);
-    // Randomization reset policy
-    Verilated::randReset(2);
-    Verilated::mkdir("./log");
-
-    // Instantiate our design
-    VTestHarness * ptTbTop = new VTestHarness;
-
-    // Tracing (vcd)
-    VerilatedVcdC * m_trace = NULL;
-    const char* flag_vcd = Verilated::commandArgsPlusMatch("vcd");
-    if (flag_vcd && 0==strcmp(flag_vcd, "+vcd"))
-    {
-        Verilated::traceEverOn(true); // Verilator must compute traced signals
-        m_trace = new VerilatedVcdC;
-        ptTbTop->trace(m_trace, 1); // Trace 99 levels of hierarchy
-        m_trace->open("./log/tb.vcd");
-    }
-
-    FILE * trace_fd = NULL;
-    // If verilator was invoked with --trace argument,
-    // and if at run time passed the +trace argument, turn on tracing
-    const char* flag_trace = Verilated::commandArgsPlusMatch("trace");
-    if (flag_trace && 0==strcmp(flag_trace, "+trace"))
-    {
-        trace_fd = fopen("./log/tb.trace", "w");
-    }
-
-    int m_cpu_tickcount = 0;
-    //int m_jtag_tickcount = 0;
-
-    //jtag
-    remote_bitbang_t * jtag = NULL;
-    jtag = new remote_bitbang_t(9823);
-
-
-    while(!contextp->gotFinish())  /* && m_cpu_tickcount < 200 */
-    {
-        //cpu reset
-        if(m_cpu_tickcount<10)
-        {
-            ptTbTop->reset = 1;
-        }
-        else
-        {
-            if(ptTbTop->reset == 1)
-                printf("reset the cpu,done \n");
-            ptTbTop->reset = 0;
-        }
-
-        ptTbTop->clock = 0;
-
-
-        ptTbTop->eval();
-        if(m_trace)
-        {
-	        m_trace->dump(m_cpu_tickcount*10);   //  Tick every 10 ns
-	    }
-
-        ptTbTop->clock = 1;
-        ptTbTop->eval();
-        if(m_trace)
-        {
-            m_trace->dump(m_cpu_tickcount*10+5);   // Trailing edge dump
-            m_trace->flush();
-        }
-        m_cpu_tickcount++;
-    }
-
-    if(m_trace)
-    {
-        m_trace->flush();
-        m_trace->close();
-    }
-
-    if(trace_fd)
-    {
-        fflush(trace_fd);
-        fclose(trace_fd);
-    }
-
-#if VM_COVERAGE
-    VerilatedCov::write("log/coverage.dat");
-#endif // VM_COVERAGE
-
-    delete ptTbTop;
-    delete jtag;
-    exit(0);
+  return trace_count;
 }
 
+static void usage(const char * program_name)
+{
+  printf("Usage: %s [EMULATOR OPTION]... [VERILOG PLUSARG]... [HOST OPTION]... BINARY [TARGET OPTION]...\n",
+         program_name);
+  fputs("\
+Run a BINARY on the Rocket Chip emulator.\n\
+\n\
+Mandatory arguments to long options are mandatory for short options too.\n\
+\n\
+EMULATOR OPTIONS\n\
+  -c, --cycle-count        Print the cycle count before exiting\n\
+       +cycle-count\n\
+  -h, --help               Display this help and exit\n\
+  -m, --max-cycles=CYCLES  Kill the emulation after CYCLES\n\
+       +max-cycles=CYCLES\n\
+  -s, --seed=SEED          Use random number seed SEED\n\
+  -r, --rbb-port=PORT      Use PORT for remote bit bang (with OpenOCD and GDB) \n\
+                           If not specified, a random port will be chosen\n\
+                           automatically.\n\
+  -V, --verbose            Enable all Chisel printfs (cycle-by-cycle info)\n\
+       +verbose\n\
+", stdout);
+
+#if VM_TRACE == 0
+  fputs("\
+\n\
+EMULATOR DEBUG OPTIONS (only supported in debug build -- try `make debug`)\n",
+        stdout);
+#endif
+
+  fputs("\
+  -v, --vcd=FILE,          Write vcd trace to FILE (or '-' for stdout)\n\
+  -x, --dump-start=CYCLE   Start VCD tracing at CYCLE\n\
+       +dump-start\n\
+", stdout);
+  fputs("\n" PLUSARG_USAGE_OPTIONS, stdout);
+  fputs("\n" HTIF_USAGE_OPTIONS, stdout);
+  printf("\n"
+"EXAMPLES\n"
+"  - run a bare metal test:\n"
+"    %s $RISCV/riscv64-unknown-elf/share/riscv-tests/isa/rv64ui-p-add\n"
+"  - run a bare metal test showing cycle-by-cycle information:\n"
+"    %s +verbose $RISCV/riscv64-unknown-elf/share/riscv-tests/isa/rv64ui-p-add 2>&1 | spike-dasm\n"
+#if VM_TRACE
+"  - run a bare metal test to generate a VCD waveform:\n"
+"    %s -v rv64ui-p-add.vcd $RISCV/riscv64-unknown-elf/share/riscv-tests/isa/rv64ui-p-add\n"
+#endif
+"  - run an ELF (you wrote, called 'hello') using the proxy kernel:\n"
+"    %s pk hello\n",
+         program_name, program_name, program_name
+#if VM_TRACE
+         , program_name
+#endif
+         );
+}
+
+int main(int argc, char** argv)
+{
+  unsigned random_seed = (unsigned)time(NULL) ^ (unsigned)getpid();
+  uint64_t max_cycles = -1;
+  int ret = 0;
+  bool print_cycles = false;
+  // Port numbers are 16 bit unsigned integers.
+  uint16_t rbb_port = 9023;
+
+#if VM_TRACE
+  const char* vcdfile_name = NULL;
+  FILE * vcdfile = NULL;
+  uint64_t start = 0;
+#endif
+
+  int verilog_plusargs_legal = 1;
+
+  int verilated_argc = 1;
+  char** verilated_argv = new char*[argc];
+  verilated_argv[0] = argv[0];
+
+  opterr = 1;
+
+  while (1)
+  {
+    static struct option long_options[] =
+    {
+      {"cycle-count",     no_argument,       0, 'c' },
+      {"help",            no_argument,       0, 'h' },
+      {"max-cycles",      required_argument, 0, 'm' },
+      {"seed",            required_argument, 0, 's' },
+      {"rbb-port",        required_argument, 0, 'r' },
+      {"verbose",         no_argument,       0, 'V' },
+      {"permissive",      no_argument,       0, 'p' },
+      {"permissive-off",  no_argument,       0, 'o' },
+#if VM_TRACE
+      {"vcd",             required_argument, 0, 'v' },
+      {"dump-start",      required_argument, 0, 'x' },
+#endif
+      HTIF_LONG_OPTIONS
+    };
+
+    int option_index = 0;
+#if VM_TRACE
+    int c = getopt_long(argc, argv, "-chm:s:r:v:Vx:po", long_options, &option_index);
+#else
+    int c = getopt_long(argc, argv, "-chm:s:r:Vpo", long_options, &option_index);
+#endif
+    if (c == -1) break;
+ retry:
+    switch (c)
+    {
+      // Process long and short EMULATOR options
+      case '?': usage(argv[0]);             return 1;
+      case 'c': print_cycles = true;        break;
+      case 'h': usage(argv[0]);             return 0;
+      case 'm': max_cycles = atoll(optarg); break;
+      case 's': random_seed = atoi(optarg); break;
+      case 'r': rbb_port = atoi(optarg);    break;
+      case 'V': verbose = true;             break;
+      case 'p': opterr = 0;                 break;
+      case 'o': opterr = 1;                 break;
+#if VM_TRACE
+      case 'v': {
+        vcdfile_name = optarg;
+        vcdfile = strcmp(optarg, "-") == 0 ? stdout : fopen(optarg, "w");
+        if (!vcdfile) {
+          std::cerr << "Unable to open " << optarg << " for VCD write\n";
+          return 1;
+        }
+        break;
+      }
+      case 'x': start = atoll(optarg);      break;
+#endif
+      // Process legacy '+' EMULATOR arguments by replacing them with
+      // their getopt equivalents
+      case 1:
+      {
+        std::string arg = optarg;
+        if (arg.substr(0, 1) != "+") {
+          optind--;
+          goto done_processing;
+        }
+        if (arg == "+verbose")
+          c = 'V';
+        else if (arg.substr(0, 12) == "+max-cycles=") {
+          c = 'm';
+          optarg = optarg+12;
+        }
+#if VM_TRACE
+        else if (arg.substr(0, 12) == "+dump-start=") {
+          c = 'x';
+          optarg = optarg+12;
+        }
+#endif
+        else if (arg.substr(0, 12) == "+cycle-count")
+          c = 'c';
+        else if (arg == "+permissive")
+        {
+          c = 'p';
+          verilated_argv[verilated_argc++] = optarg;
+        }
+        else if (arg == "+permissive-off")
+        {
+          c = 'o';
+          verilated_argv[verilated_argc++] = optarg;
+        }
+
+        // If we don't find a legacy '+' EMULATOR argument, it still could be
+        // a VERILOG_PLUSARG and not an error.
+        else if (verilog_plusargs_legal)
+        {
+          const char ** plusarg = &verilog_plusargs[0];
+
+          int legal_verilog_plusarg = 0;
+
+          while (*plusarg && (legal_verilog_plusarg == 0))
+          {
+            if (arg.substr(1, strlen(*plusarg)) == *plusarg)
+            {
+              legal_verilog_plusarg = 1;
+            }
+            plusarg ++;
+          }
+
+          if (!legal_verilog_plusarg)
+          {
+            verilog_plusargs_legal = 0;
+          }
+          else
+          {
+            c = 'P';
+          }
+          goto retry;
+        }
+
+        // If we STILL don't find a legacy '+' argument, it still could be
+        // an HTIF (HOST) argument and not an error. If this is the case, then
+        // we're done processing EMULATOR and VERILOG arguments.
+        else
+        {
+          static struct option htif_long_options [] = { HTIF_LONG_OPTIONS };
+          struct option * htif_option = &htif_long_options[0];
+          while (htif_option->name)
+          {
+            if (arg.substr(1, strlen(htif_option->name)) == htif_option->name)
+            {
+              optind--;
+              goto done_processing;
+            }
+            htif_option++;
+          }
+          if(opterr)
+          {
+            std::cerr << argv[0] << ": invalid plus-arg (Verilog or HTIF) \""
+                      << arg << "\"\n";
+            c = '?';
+          } else {
+            c = 'P';
+          }
+        }
+        goto retry;
+      }
+      case 'P': // Verilog PlusArg, add to the argument list for verilator environment
+        verilated_argv[verilated_argc++] = optarg;
+        break;
+
+      // Realize that we've hit HTIF (HOST) arguments or error out
+      default:
+        if (c >= HTIF_LONG_OPTIONS_OPTIND)
+        {
+          optind--;
+          goto done_processing;
+        }
+        c = '?';
+        goto retry;
+    }
+  }
+
+done_processing:
+  if (optind == argc)
+  {
+    std::cerr << "No binary specified for emulator\n";
+    usage(argv[0]);
+    return 1;
+  }
+
+  // Copy remaining HTIF arguments (if any) and the binary file name into the verilator argument stack
+  while (optind < argc) verilated_argv[verilated_argc++] = argv[optind++];
+
+  if (verbose)
+    fprintf(stderr, "using random seed %u\n", random_seed);
+
+  srand(random_seed);
+  srand48(random_seed);
+
+  Verilated::randReset(2);
+  Verilated::commandArgs(verilated_argc, verilated_argv);
+  VTestHarness *tile = new VTestHarness;
+
+#if VM_TRACE
+  Verilated::traceEverOn(true); // Verilator must compute traced signals
+#if CY_FST_TRACE
+  std::unique_ptr<VerilatedFstC> tfp(new VerilatedFstC);
+#else
+  std::unique_ptr<VerilatedVcdFILE> vcdfd(new VerilatedVcdFILE(vcdfile));
+  std::unique_ptr<VerilatedVcdC> tfp(new VerilatedVcdC(vcdfd.get()));
+#endif // CY_FST_TRACE
+  if (vcdfile_name) {
+    tile->trace(tfp.get(), 99);  // Trace 99 levels of hierarchy
+    tfp->open(vcdfile_name);
+  }
+#endif // VM_TRACE
+
+  // RocketChip currently only supports RBB port 0, so this needs to stay here
+  jtag = new remote_bitbang_t(rbb_port);
+
+  bool dump;
+  // start reset off low so a rising edge triggers async reset
+  tile->reset = 0;
+  tile->clock = 0;
+  tile->eval();
+  // reset for several cycles to handle pipelined reset
+  for (int i = 0; i < 100; i++) {
+    tile->reset = 1;
+    tile->clock = 0;
+    tile->eval();
+#if VM_TRACE
+    dump = tfp && trace_count >= start;
+    if (dump)
+      tfp->dump(static_cast<vluint64_t>(trace_count * 2));
+#endif
+    tile->clock = 1;
+    tile->eval();
+#if VM_TRACE
+    if (dump)
+      tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
+#endif
+    trace_count ++;
+  }
+  tile->reset = 0;
+  done_reset = true;
+
+  do {
+    tile->clock = 0;
+    tile->eval();
+#if VM_TRACE
+    dump = tfp && trace_count >= start;
+    if (dump)
+      tfp->dump(static_cast<vluint64_t>(trace_count * 2));
+#endif
+
+    tile->clock = 1;
+    tile->eval();
+#if VM_TRACE
+    if (dump)
+      tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
+#endif
+    trace_count++;
+  }  while ((!jtag || !jtag->done()) && !tile->io_success && trace_count < max_cycles);
+
+#if VM_TRACE
+  if (tfp)
+    tfp->close();
+  if (vcdfile)
+    fclose(vcdfile);
+#endif
+
+  if (jtag && jtag->exit_code())
+  {
+    fprintf(stderr, "*** FAILED *** via jtag (code = %d, seed %d) after %ld cycles\n", jtag->exit_code(), random_seed, trace_count);
+    ret = jtag->exit_code();
+  }
+  else if (trace_count == max_cycles)
+  {
+    fprintf(stderr, "*** FAILED *** via trace_count (timeout, seed %d) after %ld cycles\n", random_seed, trace_count);
+    ret = 2;
+  }
+  else if (verbose || print_cycles)
+  {
+    fprintf(stderr, "*** PASSED *** Completed after %ld cycles\n", trace_count);
+  }
+
+  if (jtag) delete jtag;
+  if (tile) delete tile;
+  if (verilated_argv) delete[] verilated_argv;
+  return ret;
+}
